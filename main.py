@@ -9,7 +9,8 @@ from sqlite3 import Error
 import re
 import os
 
-#TODO implement absolute and relative time
+#TODO implement remove_meal command
+#TODO remove tokenizer, switch to full RE
 #Global variables
 
 database_dir = 'db'
