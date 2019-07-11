@@ -371,11 +371,12 @@ def process(bot, update, user_data):
     meal_time = extract_time(user_id, text)
     meal_type = extract_type(text)
     log_bool = not log_regex.search(text.lower()) is None
+    schedule = False
 
     if not (meal_type is None or meal_time is None):
         if save_meal(user_id, meal_type, meal_time):
             message = confirmation_message(meal_type, meal_time)
-            schedule_message(bot, user_id)
+            schedule = True
         else:
             message = "There was an error and the meal could not be saved.\n"
         state = -1
@@ -395,6 +396,8 @@ def process(bot, update, user_data):
         state = -1
 
     bot.send_message(chat_id=chat_id, text=message)
+    if schedule:
+        schedule_message(bot, user_id)
     return state
 
 def get_type(bot, update, user_data):
@@ -403,6 +406,7 @@ def get_type(bot, update, user_data):
     user_id = update.message.from_user.id
     error_message = "There was an error and the meal could not be saved.\n"
     meal_time = None
+    schedule = False
 
     try:
         meal_time = user_data['meal_time']
@@ -421,12 +425,14 @@ def get_type(bot, update, user_data):
     elif save_meal(user_id, meal_type, meal_time):
         message = confirmation_message(meal_type, meal_time)
         state = -1
-        schedule_message(bot, user_id)
+        schedule = True
     else:
         message = error_message
         state = -1
 
     bot.send_message(chat_id=chat_id, text=message)
+    if schedule:
+        schedule_message(bot, user_id)
     return state
 
 def get_time(bot, update, user_data):
@@ -435,6 +441,7 @@ def get_time(bot, update, user_data):
     user_id = update.message.from_user.id
     error_message = "There was an error and the meal could not be saved.\n"
     meal_type = None
+    schedule = False
 
     try:
         meal_type = user_data['meal_type']
@@ -453,12 +460,14 @@ def get_time(bot, update, user_data):
     elif save_meal(user_id, meal_type, meal_time):
         message = confirmation_message(meal_type, meal_time)
         state = -1
-        schedule_message(bot, user_id)
+        schedule = True
     else:
         message = error_message
         state = -1
 
     bot.send_message(chat_id=chat_id, text=message)
+    if schedule:
+        schedule_message(bot, user_id)
     return state
 
 def remove_entry(bot, update, user_data):
@@ -533,7 +542,8 @@ def entry_selected(bot, update, user_data):
 def schedule_message(bot, user_id):
     schedule.clear(str(user_id))
     next_entry = predict(user_id, 10)
-    schedule.every().day.at(next_entry.strftime('%H:%M')).do(send_intervention_message, bot, user_id).tag(str(user_id))
+    if not next_entry is None:
+        schedule.every().day.at(next_entry.strftime('%H:%M')).do(send_intervention_message, bot, user_id).tag(str(user_id))
 
 #Send intervention message and feedback menu, meant to be scheduled
 def send_intervention_message(bot, user_id):
