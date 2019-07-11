@@ -2,13 +2,27 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryH
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 import telegramcalendar
 from timezonefinder import TimezoneFinder
+import schedule
+from threading import Thread
 from datetime import datetime, timedelta
 import pytz
 import sqlite3
 from sqlite3 import Error
 import re
 import os
-
+import time
+import warnings
+import pickle
+import numpy as np
+import pandas as pd
+from sklearn import preprocessing
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import BaggingRegressor, RandomForestRegressor
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 primary_key = '640443271:AAEXY8w0JaSVcXT_3TrzBPK1GGtCweOQPD8'
 testing_key = '826578423:AAHYAQ-HDFpjP29pdcbdhZffqU9WgLZvghU'
@@ -94,19 +108,31 @@ def setup():
                             timeZone TEXT NOT NULL)'''
     #Create the user-meal table
     #Columns: 
+    #user:= User id of the user associated with the meal
+    #mealDate:= Date of the meal, stored as '%Y-%m-%d'
+    #mealTime:= Time of the meal, stored as '%H-%M'
     #mealType:= Type of meal, 0 for snack, 1 for full meal
-    #mealTime:= Time of the meal as ISO8601 strings
-    #user:= Chat id of the user associated with the meal
     create_meals_table = '''CREATE TABLE meals
                             (user INT,
                             mealDate TEXT,
                             mealTime TEXT,
                             mealType INT,
                             FOREIGN KEY(user) REFERENCES users(userID))'''
+    #Create the model table
+    #Columns:
+    #user:= User id of the user associated with the model
+    #model:= Best performing model for the user, pickled 
+    #feedback:= User feedback on notification timing, denotes minutes
+    create_models_table= '''CREATE TABLE models
+                            (user INT,
+                            model BlOB,
+                            feedback INT,
+                            FOREIGN KEY(user) REFERENCES users(userID))'''
     conn = get_database_connection(database)
     c = conn.cursor()
     c.execute(create_users_table)
     c.execute(create_meals_table)
+    c.execute(create_models_table)
     conn.commit()
     return_database_connection(conn)
     print('Setup successfully completed.')
@@ -349,6 +375,7 @@ def process(bot, update, user_data):
     if not (meal_type is None or meal_time is None):
         if save_meal(user_id, meal_type, meal_time):
             message = confirmation_message(meal_type, meal_time)
+            schedule_message(bot, user_id)
         else:
             message = "There was an error and the meal could not be saved.\n"
         state = -1
@@ -394,6 +421,7 @@ def get_type(bot, update, user_data):
     elif save_meal(user_id, meal_type, meal_time):
         message = confirmation_message(meal_type, meal_time)
         state = -1
+        schedule_message(bot, user_id)
     else:
         message = error_message
         state = -1
@@ -425,6 +453,7 @@ def get_time(bot, update, user_data):
     elif save_meal(user_id, meal_type, meal_time):
         message = confirmation_message(meal_type, meal_time)
         state = -1
+        schedule_message(bot, user_id)
     else:
         message = error_message
         state = -1
@@ -447,8 +476,6 @@ def calendar_action(bot, update, user_data):
     if selected:
         chat_id = update.callback_query.message.chat_id
         user_id = update.callback_query.from_user.id
-        markup_id = user_data['markup_id']
-        bot.deleteMessage(chat_id=chat_id, message_id=markup_id)
         entries = None
         conn = get_database_connection(database)
         c = conn.cursor()
@@ -483,10 +510,10 @@ def entry_selected(bot, update, user_data):
     query = update.callback_query
     chat_id = query.message.chat_id
     user_id = query.from_user.id
-    markup_id = user_data['markup_id']
-    bot.deleteMessage(chat_id=chat_id, message_id=markup_id)
     meal_time = query.data
     meal_date = user_data['date']
+    query.answer()
+    query.message.delete()
     conn = get_database_connection(database)
     c = conn.cursor()
     try:
@@ -502,7 +529,225 @@ def entry_selected(bot, update, user_data):
     bot.send_message(chat_id=chat_id, text=text)
     return -1
 
+#Predict the next entry for a user and schedule a message
+def schedule_message(bot, user_id):
+    schedule.clear(str(user_id))
+    next_entry = predict(user_id, 10)
+    schedule.every().day.at(next_entry.strftime('%H:%M')).do(send_intervention_message, bot, user_id).tag(str(user_id))
+
+#Send intervention message and feedback menu, meant to be scheduled
+def send_intervention_message(bot, user_id):
+    text = 'It looks like you might be getting hungry.\n'
+    text += 'Please rate the timing of this message.\n'
+    choices = [[InlineKeyboardButton('Too Early', callback_data=30),
+                InlineKeyboardButton('Early', callback_data=15),
+                InlineKeyboardButton('On Time', callback_data=0),
+                InlineKeyboardButton('Late', callback_data=-15),
+                InlineKeyboardButton('Too Late', callback_data=-30)]]
+
+    reply_markup = InlineKeyboardMarkup(choices)
+    bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+    return schedule.CancelJob
+
+def process_feedback(bot, update):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    feedback = int(query.data)
+    query.answer()
+    query.message.delete()
+    conn = get_database_connection(database)
+    c = conn.cursor()
+    c.execute('SELECT feedback FROM models  WHERE user=?',(user_id,))
+    feedback_old = c.fetchone()
+    feedback += feedback_old[0]
+    c.execute('UPDATE models SET feedback=? WHERE user=?',(feedback, user_id))
+    conn.commit()
+    return_database_connection(conn)
+
+
+
+####Machine Learning Starts here
+#Accepts a numpy array of logs
+#Returns array of feautures and targets
+def feature_template(data):
+    new_data = np.zeros((data.shape[0]-1,12))
+    current_datetime = ''
+    meal_count = 0
+    snack_count = 0
+    counter = 0
+    meal = 0
+    first = True
+    for row in data:
+        if first:
+            current_datetime = datetime.strptime(row[1]+' '+row[2], '%Y-%m-%d %H:%M')
+            meal = row[3]
+            first = False
+            continue
+
+        new_datetime = datetime.strptime(row[1]+' '+row[2], '%Y-%m-%d %H:%M')
+        new_data[counter][int(current_datetime.strftime('%w'))] = 1
+        new_data[counter][7] = meal_count
+        new_data[counter][8] = snack_count
+        new_data[counter][9] = meal
+        new_data[counter][10] = int(current_datetime.strftime('%H')) * 60 + int(current_datetime.strftime('%M'))
+        diff = new_datetime - current_datetime
+        new_data[counter][11] = diff.days*1440 + diff.seconds/60
+        if current_datetime.date() == new_datetime.date():
+            if meal:
+                meal_count += 1
+            else:
+                snack_count += 1
+        else:
+            meal_count = 0
+            snack_count = 0
+
+        current_datetime = new_datetime
+        meal = row[3]
+        counter += 1
+
+    last_entry = np.zeros((11,1))
+    last_entry[int(current_datetime.strftime('%w'))] = 1
+    last_entry[7] = meal_count
+    last_entry[8] = snack_count
+    last_entry[9] = meal
+    last_entry[10] = int(current_datetime.strftime('%H')) * 60 + int(current_datetime.strftime('%M'))
+
+    previous_entries = pd.DataFrame(new_data, columns=
+                                    ['Sunday','Monday','Tuesday','Wednesday',
+                                    'Thursday','Friday','Saturday','Meals So Far',
+                                    'Snacks So Far','Meal or Snack','Time of Entry','Next Entry'])
+
+    return previous_entries, last_entry
+
+#Data preprocessing
+def preprocess(df):
+    X = df.values[:,:11]
+    y = df.values[:,11]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+    X_min_max_scaler = preprocessing.MinMaxScaler()
+    y_min_max_scaler = preprocessing.MinMaxScaler()
+    X_train = X_min_max_scaler.fit_transform(X_train)
+    y_train = np.ravel(y_min_max_scaler.fit_transform(y_train.reshape(-1, 1)))
+    X_test = X_min_max_scaler.transform(X_test)
+    y_test = np.ravel(y_min_max_scaler.transform(y_test.reshape(-1, 1)))
+    return {'X_train':X_train,
+            'X_test':X_test,
+            'y_train':y_train,
+            'y_test':y_test,
+            'X_scaler':X_min_max_scaler,
+            'y_scaler':y_min_max_scaler}
+
+def train_test(data, model, parameters=None, ensemble=False, rfr=False):
+    if ensemble:
+        clf = BaggingRegressor(model,max_samples=1.0, max_features=0.7)
+    elif rfr:
+        clf = clf = RandomForestRegressor(max_features=0.7)
+    else:
+        clf = GridSearchCV(model, parameters, cv=10)
+    clf.fit(data['X_train'], data['y_train'])
+    score = clf.score(data['X_test'], data['y_test'])
+    return {'model':clf,'score':score}
+
+def models(data_dict):
+    clf_dict = {}
+    clf_dict['tree_model'] = train_test(data_dict, DecisionTreeRegressor(),{})
+    clf_dict['linear_model'] = train_test(data_dict, LinearRegression(), {})
+    clf_dict['ridge_model'] = train_test(data_dict, Ridge(), {'alpha':[1.0,0.5]})
+    clf_dict['svr_model'] = train_test(data_dict, SVR(kernel='linear'), {'C':[1.0,0.5,0.1]})
+    clf_dict['random_forest_model'] = train_test(data_dict, RandomForestRegressor(max_features=0.7), rfr=True)
+    clf_dict['linear_ensemble_model'] = train_test(data_dict, LinearRegression(), ensemble=True)
+    clf_dict['ridge_ensemble_model'] = train_test(data_dict, Ridge(), ensemble=True)
+    clf_dict['svr_ensemble_model'] = train_test(data_dict, SVR(kernel='linear'), ensemble=True)
+    return clf_dict
+
+#Import the data from the database
+def get_data(user_id):
+    conn = get_database_connection(database)
+    c = conn.cursor()
+    c.execute('SELECT * FROM meals WHERE user=?',(user_id,))
+    meals = c.fetchall()
+    c.execute('SELECT * FROM models WHERE user=?',(user_id,))
+    data = c.fetchone()
+    if data is None:
+        model = None
+        feedback = 0
+        score = 0
+    else:
+        model_data = pickle.loads(data[1])
+        feedback = data[2]
+        model = model_data['model']
+        score = model_data['score']
+    return_database_connection(conn)
+    return meals, model, score, feedback
+
+#Normalize the data
+def normalize(data):
+    data.mealTime = data.mealTime.apply(lambda x:x[:5])
+    data = data.sort_values(by=['mealDate','mealTime'])
+    return data
+
+def save_model(user_id, model, feedback):
+    model_data = pickle.dumps(model)
+    conn = get_database_connection(database)
+    c = conn.cursor()
+    c.execute('REPLACE INTO models(user,model,feedback) VALUES(?,?,?)',(user_id, model_data, feedback))
+    conn.commit()
+    return_database_connection(conn)
+
+#Returns the prediction for the next entry time
+def predict(user_id, iterations = None):
+    meals, best_model, best_score, feedback = get_data(user_id)
+    data = pd.DataFrame(meals, columns =['userId', 'mealDate', 'mealTime', 'mealType'])
+    data = normalize(data)
+    previous_entries, x_predict = feature_template(data.values)
+    data_dict = preprocess(previous_entries)
+    x_predict = data_dict['X_scaler'].transform(x_predict.T)
+    if best_score == 0:
+        #First time training a model for user, 100 iterations
+        iterations = 100
+    elif not iterations:
+        iterations = 1
+    for i in range(iterations):
+        clf_dict = models(data_dict)
+        for name, clf in clf_dict.items():
+            if clf['score'] > best_score:
+                best_model = clf['model']
+                best_score = clf['score']
+
+    if best_model is None:
+        return None
+    else:
+        save_model(user_id, {'model':best_model, 'score':best_score}, feedback)
+
+    prediction = best_model.predict(x_predict)
+    last_entry = datetime.strptime(data['mealDate'].iat[-1]+' '+data['mealTime'].iat[-1], '%Y-%m-%d %H:%M')
+    minutes = data_dict['y_scaler'].inverse_transform(prediction.reshape(1,-1))
+    delta = timedelta(minutes=(minutes[0][0]+feedback))
+    next_entry = last_entry + delta
+    return next_entry
+
+def create_models_table():
+    conn = get_database_connection(database)
+    c = conn.cursor()
+    create_phrase = '''CREATE TABLE models
+                    (user INT UNIQUE,
+                    model BlOB,
+                    feedback INT,
+                    FOREIGN KEY(user) REFERENCES users(userID))'''
+    c.execute(create_phrase)
+    conn.commit()
+    return_database_connection(conn)
+
+def check_schedule():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
 def main():
+    schedule_thread = Thread(target=check_schedule)
+    schedule_thread.start()
+
     database_exists = os.path.isfile(database)
     if not database_exists:
         setup()
@@ -530,6 +775,8 @@ def main():
     entry_selected_handler = CallbackQueryHandler(entry_selected, pass_user_data=True)
     #Auxiliary cancel handler
     cancel_operation_handler = MessageHandler(Filters.all, cancel_operation, pass_user_data=True)
+    #Feedback handler
+    feedback_handler = CallbackQueryHandler(process_feedback)
 
     #Conversation handler for start command
     dispatcher.add_handler(ConversationHandler([start_handler], {0:[timezone_received_handler], 1:[goal_selected_handler]}, [start_assert_handler]))
@@ -541,9 +788,12 @@ def main():
     dispatcher.add_handler(ConversationHandler([remove_entry_handler],{0:[calendar_action_handler], 1:[entry_selected_handler]}, [cancel_operation_handler]))
     #Conversation handler for meal logging
     dispatcher.add_handler(ConversationHandler([initial_handler],{0:[initial_handler], 1:[get_type_handler], 2:[get_time_handler]}, [cancel_operation_handler]))
+    #Feedback handler
+    dispatcher.add_handler(feedback_handler)
 
     updater.start_polling()
     updater.idle()
+    schedule_thread.join()
 
 if __name__ == '__main__':
     main()
